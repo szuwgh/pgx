@@ -1,6 +1,7 @@
 package pgconn
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"gitee.com/Trisia/gotlcp/tlcp"
+	"github.com/emmansun/gmsm/smx509"
 	"github.com/jackc/pgpassfile"
 	"github.com/jackc/pgservicefile"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
@@ -30,12 +33,15 @@ type GetSSLPasswordFunc func(ctx context.Context) string
 // Config is the settings used to establish a connection to a PostgreSQL server. It must be created by [ParseConfig]. A
 // manually initialized Config will cause ConnectConfig to panic.
 type Config struct {
-	Host           string // host (e.g. localhost) or absolute path to unix domain socket directory (e.g. /private/tmp)
-	Port           uint16
-	Database       string
-	User           string
-	Password       string
-	TLSConfig      *tls.Config // nil disables TLS
+	Host     string // host (e.g. localhost) or absolute path to unix domain socket directory (e.g. /private/tmp)
+	Port     uint16
+	Database string
+	User     string
+	Password string
+	SslTLCP  bool
+
+	TLSConfig      *tls.Config  // nil disables TLS
+	TLCPConfig     *tlcp.Config // nil disables TLCP
 	ConnectTimeout time.Duration
 	DialFunc       DialFunc   // e.g. net.Dialer.DialContext
 	LookupFunc     LookupFunc // e.g. net.Resolver.LookupHost
@@ -115,17 +121,19 @@ func (c *Config) Copy() *Config {
 // FallbackConfig is additional settings to attempt a connection with when the primary Config fails to establish a
 // network connection. It is used for TLS fallback such as sslmode=prefer and high availability (HA) connections.
 type FallbackConfig struct {
-	Host      string // host (e.g. localhost) or path to unix domain socket directory (e.g. /private/tmp)
-	Port      uint16
-	TLSConfig *tls.Config // nil disables TLS
+	Host       string // host (e.g. localhost) or path to unix domain socket directory (e.g. /private/tmp)
+	Port       uint16
+	TLSConfig  *tls.Config  // nil disables TLS
+	TLCPConfig *tlcp.Config // nil disables TLCP
 }
 
 // connectOneConfig is the configuration for a single attempt to connect to a single host.
 type connectOneConfig struct {
 	network          string
 	address          string
-	originalHostname string      // original hostname before resolving
-	tlsConfig        *tls.Config // nil disables TLS
+	originalHostname string       // original hostname before resolving
+	tlsConfig        *tls.Config  // nil disables TLS
+	tlcpConfig       *tlcp.Config // nil disables TLS
 }
 
 // isAbsolutePath checks if the provided value is an absolute path either
@@ -275,11 +283,14 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		settings = mergeSettings(defaultSettings, envSettings, serviceSettings, connStringSettings)
 	}
 
+	fmt.Println("settings:", settings)
+
 	config := &Config{
 		createdByParseConfig: true,
 		Database:             settings["database"],
 		User:                 settings["user"],
 		Password:             settings["password"],
+		SslTLCP:              settings["ssltlcp"] == "1" || settings["ssltlcp"] == "true",
 		RuntimeParams:        make(map[string]string),
 		BuildFrontend: func(r io.Reader, w io.Writer) *pgproto3.Frontend {
 			return pgproto3.NewFrontend(r, w)
@@ -319,6 +330,9 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		"passfile":             {},
 		"connect_timeout":      {},
 		"sslmode":              {},
+		"ssltlcp":              {},
+		"sslenckey":            {},
+		"sslenccert":           {},
 		"sslkey":               {},
 		"sslcert":              {},
 		"sslrootcert":          {},
@@ -366,30 +380,55 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		}
 
 		var tlsConfigs []*tls.Config
+		var tlcpConfigs []*tlcp.Config
 
-		// Ignore TLS settings if Unix domain socket like libpq
-		if network, _ := NetworkAddress(host, port); network == "unix" {
-			tlsConfigs = append(tlsConfigs, nil)
+		if config.SslTLCP {
+			fmt.Println("config.SslTLCP is set, using TLCP protocol")
+			// If SslTLCP is set, we use the TLCP protocol.
+			if network, _ := NetworkAddress(host, port); network == "unix" {
+				tlcpConfigs = append(tlcpConfigs, nil)
+			} else {
+				var err error
+				tlcpConfigs, err = configTLCP(settings, host, options)
+				if err != nil {
+					return nil, &ParseConfigError{ConnString: connString, msg: "failed to configure TLS", err: err}
+				}
+			}
+
+			for _, tlcpconfig := range tlcpConfigs {
+				fallbacks = append(fallbacks, &FallbackConfig{
+					Host:       host,
+					Port:       port,
+					TLCPConfig: tlcpconfig,
+				})
+			}
 		} else {
-			var err error
-			tlsConfigs, err = configTLS(settings, host, options)
-			if err != nil {
-				return nil, &ParseConfigError{ConnString: connString, msg: "failed to configure TLS", err: err}
+			// Ignore TLS settings if Unix domain socket like libpq
+			if network, _ := NetworkAddress(host, port); network == "unix" {
+				tlsConfigs = append(tlsConfigs, nil)
+			} else {
+				var err error
+				tlsConfigs, err = configTLS(settings, host, options)
+				if err != nil {
+					return nil, &ParseConfigError{ConnString: connString, msg: "failed to configure TLS", err: err}
+				}
+			}
+
+			for _, tlsConfig := range tlsConfigs {
+				fallbacks = append(fallbacks, &FallbackConfig{
+					Host:      host,
+					Port:      port,
+					TLSConfig: tlsConfig,
+				})
 			}
 		}
 
-		for _, tlsConfig := range tlsConfigs {
-			fallbacks = append(fallbacks, &FallbackConfig{
-				Host:      host,
-				Port:      port,
-				TLSConfig: tlsConfig,
-			})
-		}
 	}
 
 	config.Host = fallbacks[0].Host
 	config.Port = fallbacks[0].Port
 	config.TLSConfig = fallbacks[0].TLSConfig
+	config.TLCPConfig = fallbacks[0].TLCPConfig
 	config.Fallbacks = fallbacks[1:]
 	config.SSLNegotiation = settings["sslnegotiation"]
 
@@ -642,6 +681,223 @@ func parseServiceSettings(servicefilePath, serviceName string) (map[string]strin
 	}
 
 	return settings, nil
+}
+
+// loadPEMKeyPair 支持 PEM 解密流程，返回 TLCP 可用证书结构
+func loadPEMKeyPair(certPath, keyPath, sslpassword string, getPass func(context.Context) string) (tlcp.Certificate, error) {
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return tlcp.Certificate{}, fmt.Errorf("unable to read key: %w", err)
+	}
+	block, rest := pem.Decode(keyPEM)
+	if block == nil {
+		return tlcp.Certificate{}, errors.New("failed to decode key PEM block")
+	}
+	//fmt.Println("rest:", string(rest))
+	var pemKeyBytes []byte
+	if smx509.IsEncryptedPEMBlock(block) {
+		if sslpassword == "" && getPass != nil {
+			sslpassword = getPass(context.Background())
+		}
+		if sslpassword == "" {
+			return tlcp.Certificate{}, errors.New("password required for encrypted key")
+		}
+		decryptedKey, err := smx509.DecryptPEMBlock(block, []byte(sslpassword))
+		if err != nil {
+			return tlcp.Certificate{}, fmt.Errorf("decrypt PEM block failed: %w", err)
+		}
+		pemBytes := pem.Block{
+			Type:  block.Type,
+			Bytes: decryptedKey,
+		}
+		pemKeyBytes = pem.EncodeToMemory(&pemBytes)
+	} else {
+		pemKeyBytes = pem.EncodeToMemory(block)
+	}
+
+	var keyBlocks [][]byte
+	keyBlocks = append(keyBlocks, pemKeyBytes)
+	for {
+		blk, rem := pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		rest = rem
+		keyBlocks = append(keyBlocks, pem.EncodeToMemory(blk))
+
+	}
+	if len(keyBlocks) == 0 {
+		return tlcp.Certificate{}, errors.New("no PRIVATE KEY PEM block found")
+	}
+	cleanKey := bytes.Join(keyBlocks, nil)
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return tlcp.Certificate{}, fmt.Errorf("unable to read cert: %w", err)
+	}
+	return tlcp.X509KeyPair(certPEM, cleanKey)
+}
+
+// configTLS uses libpq's TLS parameters to construct  []*tls.Config. It is
+// necessary to allow returning multiple TLS configs as sslmode "allow" and
+// "prefer" allow fallback.
+func configTLCP(settings map[string]string, thisHost string, parseConfigOptions ParseConfigOptions) ([]*tlcp.Config, error) {
+	host := thisHost
+	sslmode := settings["sslmode"]
+	sslrootcert := settings["sslrootcert"]
+	sslcert := settings["sslcert"]
+	sslkey := settings["sslkey"]
+	sslenccert := settings["sslenccert"]
+	sslenckey := settings["sslenckey"]
+	sslpassword := settings["sslpassword"]
+	sslsni := settings["sslsni"]
+	sslnegotiation := settings["sslnegotiation"]
+
+	// Match libpq default behavior
+	if sslmode == "" {
+		sslmode = "prefer"
+	}
+	if sslsni == "" {
+		sslsni = "1"
+	}
+
+	tlcpConfig := &tlcp.Config{}
+
+	if sslnegotiation == "direct" {
+		tlcpConfig.NextProtos = []string{"postgresql"}
+		if sslmode == "prefer" {
+			sslmode = "require"
+		}
+	}
+
+	if sslrootcert != "" {
+		var caCertPool *smx509.CertPool
+
+		if sslrootcert == "system" {
+			var err error
+
+			caCertPool, err = smx509.SystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("unable to load system certificate pool: %w", err)
+			}
+
+			sslmode = "verify-full"
+		} else {
+			caCertPool = smx509.NewCertPool()
+
+			caPath := sslrootcert
+			caCert, err := os.ReadFile(caPath)
+			if err != nil {
+				return nil, fmt.Errorf("unable to read CA file: %w", err)
+			}
+
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, errors.New("unable to add CA to cert pool")
+			}
+		}
+
+		tlcpConfig.RootCAs = caCertPool
+		tlcpConfig.ClientCAs = caCertPool
+	}
+
+	switch sslmode {
+	case "disable":
+		return []*tlcp.Config{nil}, nil
+	case "allow", "prefer":
+		tlcpConfig.InsecureSkipVerify = true
+	case "require":
+		// According to PostgreSQL documentation, if a root CA file exists,
+		// the behavior of sslmode=require should be the same as that of verify-ca
+		//
+		// See https://www.postgresql.org/docs/12/libpq-ssl.html
+		if sslrootcert != "" {
+			goto nextCase
+		}
+		tlcpConfig.InsecureSkipVerify = true
+		break
+	nextCase:
+		fallthrough
+	case "verify-ca":
+		// Don't perform the default certificate verification because it
+		// will verify the hostname. Instead, verify the server's
+		// certificate chain ourselves in VerifyPeerCertificate and
+		// ignore the server name. This emulates libpq's verify-ca
+		// behavior.
+		//
+		// See https://github.com/golang/go/issues/21971#issuecomment-332693931
+		// and https://pkg.go.dev/crypto/tls?tab=doc#example-Config-VerifyPeerCertificate
+		// for more info.
+		tlcpConfig.InsecureSkipVerify = true
+		tlcpConfig.VerifyPeerCertificate = func(certificates [][]byte, _ [][]*smx509.Certificate) error {
+			certs := make([]*smx509.Certificate, len(certificates))
+			for i, asn1Data := range certificates {
+				cert, err := smx509.ParseCertificate(asn1Data)
+				if err != nil {
+					return errors.New("failed to parse certificate from server: " + err.Error())
+				}
+				certs[i] = cert
+			}
+
+			// Leave DNSName empty to skip hostname verification.
+			opts := smx509.VerifyOptions{
+				Roots:         tlcpConfig.RootCAs,
+				Intermediates: smx509.NewCertPool(),
+			}
+			// Skip the first cert because it's the leaf. All others
+			// are intermediates.
+			for _, cert := range certs[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+			_, err := certs[0].Verify(opts)
+			return err
+		}
+	case "verify-full":
+		tlcpConfig.ServerName = host
+	default:
+		return nil, errors.New("sslmode is invalid")
+	}
+
+	if (sslcert != "" && sslkey == "") || (sslcert == "" && sslkey != "") {
+		return nil, errors.New(`both "sslcert" and "sslkey" are required`)
+	}
+
+	if sslcert != "" && sslkey != "" {
+		cert, err := loadPEMKeyPair(sslcert, sslkey, sslpassword, parseConfigOptions.GetSSLPassword)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load cert: %w", err)
+		}
+		tlcpConfig.Certificates = []tlcp.Certificate{cert}
+	}
+
+	if sslenccert != "" && sslenckey != "" {
+		cert, err := loadPEMKeyPair(sslenccert, sslenckey, sslpassword, parseConfigOptions.GetSSLPassword)
+		if err != nil {
+			return nil, fmt.Errorf("unable to load cert: %w", err)
+		}
+		tlcpConfig.Certificates = append(tlcpConfig.Certificates, cert)
+	}
+
+	// Set Server Name Indication (SNI), if enabled by connection parameters.
+	// Per RFC 6066, do not set it if the host is a literal IP address (IPv4
+	// or IPv6).
+	if sslsni == "1" && net.ParseIP(host) == nil {
+		tlcpConfig.ServerName = host
+	}
+
+	tlcpConfig.CipherSuites = []uint16{
+		tlcp.ECDHE_SM4_GCM_SM3,
+		tlcp.ECDHE_SM4_CBC_SM3,
+	}
+
+	switch sslmode {
+	case "allow":
+		return []*tlcp.Config{nil, tlcpConfig}, nil
+	case "prefer":
+		return []*tlcp.Config{tlcpConfig, nil}, nil
+	case "require", "verify-ca", "verify-full":
+		return []*tlcp.Config{tlcpConfig}, nil
+	default:
+		panic("BUG: bad sslmode should already have been caught")
+	}
 }
 
 // configTLS uses libpq's TLS parameters to construct  []*tls.Config. It is

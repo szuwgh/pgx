@@ -30,6 +30,7 @@ type Frontend struct {
 	authenticationSASL              AuthenticationSASL
 	authenticationSASLContinue      AuthenticationSASLContinue
 	authenticationSASLFinal         AuthenticationSASLFinal
+	authenticationSM3               AuthenticationSM3
 	backendKeyData                  BackendKeyData
 	bindComplete                    BindComplete
 	closeComplete                   CloseComplete
@@ -402,6 +403,8 @@ func (f *Frontend) Receive() (BackendMessage, error) {
 // Authentication message type constants.
 // See src/include/libpq/pqcomm.h for all
 // constants.
+// #define AUTH_REQ_SM3       13   /* sm3 password */
+// #define AUTH_REQ_SM4       14   /* sm4 password */
 const (
 	AuthTypeOk                = 0
 	AuthTypeCleartextPassword = 3
@@ -413,6 +416,9 @@ const (
 	AuthTypeSASL              = 10
 	AuthTypeSASLContinue      = 11
 	AuthTypeSASLFinal         = 12
+	// AuthTypeSM3 and AuthTypeSM4 are custom authentication types for SM3 and SM4 passwords.
+	AuthTypeSM3 = 13 // SM3 password authentication
+	AuthTypeSM4 = 14 // SM4 password authentication
 )
 
 func (f *Frontend) findAuthenticationMessageType(src []byte) (BackendMessage, error) {
@@ -442,6 +448,8 @@ func (f *Frontend) findAuthenticationMessageType(src []byte) (BackendMessage, er
 		return &f.authenticationSASLContinue, nil
 	case AuthTypeSASLFinal:
 		return &f.authenticationSASLFinal, nil
+	case AuthTypeSM3:
+		return &f.authenticationSM3, nil // Assuming authenticationSM3 is defined elsewhere
 	default:
 		return nil, fmt.Errorf("unknown authentication type: %d", f.authType)
 	}

@@ -3,6 +3,7 @@ package pgconn
 import (
 	"container/list"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/binary"
@@ -16,12 +17,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
+	"gitee.com/Trisia/gotlcp/tlcp"
 	"github.com/jackc/pgx/v5/internal/iobufpool"
 	"github.com/jackc/pgx/v5/internal/pgio"
 	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgconn/internal/bgreader"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/tjfoc/gmsm/sm3"
 )
 
 const (
@@ -178,9 +182,10 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 	// Simplify usage by treating primary config and fallbacks the same.
 	fallbackConfigs := []*FallbackConfig{
 		{
-			Host:      config.Host,
-			Port:      config.Port,
-			TLSConfig: config.TLSConfig,
+			Host:       config.Host,
+			Port:       config.Port,
+			TLSConfig:  config.TLSConfig,
+			TLCPConfig: config.TLCPConfig,
 		},
 	}
 	fallbackConfigs = append(fallbackConfigs, config.Fallbacks...)
@@ -198,6 +203,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 				address:          address,
 				originalHostname: fb.Host,
 				tlsConfig:        fb.TLSConfig,
+				tlcpConfig:       fb.TLCPConfig,
 			})
 
 			continue
@@ -222,6 +228,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 					address:          address,
 					originalHostname: fb.Host,
 					tlsConfig:        fb.TLSConfig,
+					tlcpConfig:       fb.TLCPConfig,
 				})
 			} else {
 				network, address := NetworkAddress(ip, fb.Port)
@@ -230,6 +237,7 @@ func buildConnectOneConfigs(ctx context.Context, config *Config) ([]*connectOneC
 					address:          address,
 					originalHostname: fb.Host,
 					tlsConfig:        fb.TLSConfig,
+					tlcpConfig:       fb.TLCPConfig,
 				})
 			}
 		}
@@ -300,6 +308,31 @@ func connectPreferred(ctx context.Context, config *Config, connectOneConfigs []*
 	return nil, allErrors
 }
 
+// startTLCP 在现有 net.Conn 上进行 TLCP 握手，类似 startTLS。
+// 注意：此处不需要像 PostgreSQL 协议那样发送“SSLRequest”消息。
+// 你可以直接使用 tlcp.Client() 包装连接并握手。
+func startTLCP(conn net.Conn, tlcpConfig *tlcp.Config) (net.Conn, error) {
+
+	err := binary.Write(conn, binary.BigEndian, []int32{8, 80877103})
+	if err != nil {
+		return nil, err
+	}
+
+	response := make([]byte, 1)
+	if _, err = io.ReadFull(conn, response); err != nil {
+		return nil, err
+	}
+
+	if response[0] != 'S' {
+		return nil, errors.New("server refused TLS connection")
+	}
+
+	// 包装原始连接为 TLCP 客户端连接
+	tlcpConn := tlcp.Client(conn, tlcpConfig)
+
+	return tlcpConn, nil
+}
+
 // connectOne makes one connection attempt to a single host.
 func connectOne(ctx context.Context, config *Config, connectConfig *connectOneConfig,
 	ignoreNotPreferredErr bool,
@@ -316,31 +349,65 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 		e := &perDialConnectError{address: connectConfig.address, originalHostname: connectConfig.originalHostname, err: fmt.Errorf("%s: %w", msg, err)}
 		return e
 	}
+	pgConn.config.SslTLCP = true
+	if pgConn.config.SslTLCP {
+		fmt.Println("use ssltclp")
 
-	pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
-	if err != nil {
-		return nil, newPerDialConnectError("dial error", err)
-	}
+		pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
+		if err != nil {
+			return nil, newPerDialConnectError("dial error", err)
+		}
 
-	if connectConfig.tlsConfig != nil {
 		pgConn.contextWatcher = ctxwatch.NewContextWatcher(&DeadlineContextWatcherHandler{Conn: pgConn.conn})
 		pgConn.contextWatcher.Watch(ctx)
 		var (
-			tlsConn net.Conn
-			err     error
+			tlcpConn net.Conn
 		)
+		// if connectConfig.tlcpConfig == nil {
+		// 	panic("connectConfig.tlcpConfig must not be nil when SslTLCP is true")
+		// }
+
 		if config.SSLNegotiation == "direct" {
-			tlsConn = tls.Client(pgConn.conn, connectConfig.tlsConfig)
+			tlcpConn = tlcp.Client(pgConn.conn, connectConfig.tlcpConfig)
 		} else {
-			tlsConn, err = startTLS(pgConn.conn, connectConfig.tlsConfig)
+			tlcpConn, err = startTLCP(pgConn.conn, connectConfig.tlcpConfig)
 		}
+
 		pgConn.contextWatcher.Unwatch() // Always unwatch `netConn` after TLS.
 		if err != nil {
 			pgConn.conn.Close()
 			return nil, newPerDialConnectError("tls error", err)
 		}
 
-		pgConn.conn = tlsConn
+		pgConn.conn = tlcpConn
+
+	} else {
+		fmt.Println("connectConfig.network, connectConfig.address", connectConfig.network, connectConfig.address)
+		pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
+		if err != nil {
+			return nil, newPerDialConnectError("dial error", err)
+		}
+
+		if connectConfig.tlsConfig != nil {
+			pgConn.contextWatcher = ctxwatch.NewContextWatcher(&DeadlineContextWatcherHandler{Conn: pgConn.conn})
+			pgConn.contextWatcher.Watch(ctx)
+			var (
+				tlsConn net.Conn
+				err     error
+			)
+			if config.SSLNegotiation == "direct" {
+				tlsConn = tls.Client(pgConn.conn, connectConfig.tlsConfig)
+			} else {
+				tlsConn, err = startTLS(pgConn.conn, connectConfig.tlsConfig)
+			}
+			pgConn.contextWatcher.Unwatch() // Always unwatch `netConn` after TLS.
+			if err != nil {
+				pgConn.conn.Close()
+				return nil, newPerDialConnectError("tls error", err)
+			}
+
+			pgConn.conn = tlsConn
+		}
 	}
 
 	pgConn.contextWatcher = ctxwatch.NewContextWatcher(config.BuildContextWatcherHandler(pgConn))
@@ -405,6 +472,14 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 			}
 		case *pgproto3.AuthenticationMD5Password:
 			digestedPassword := "md5" + hexMD5(hexMD5(pgConn.config.Password+pgConn.config.User)+string(msg.Salt[:]))
+			err = pgConn.txPasswordMessage(digestedPassword)
+			if err != nil {
+				pgConn.conn.Close()
+				return nil, newPerDialConnectError("failed to write password message", err)
+			}
+		case *pgproto3.AuthenticationSM3:
+			// SM3 authentication is similar to MD5, but uses the SM3 hash function.
+			digestedPassword := "sm3" + hexHmacSM3(hexHmacSM3(pgConn.config.Password, pgConn.config.User), string(msg.Salt[:]))
 			err = pgConn.txPasswordMessage(digestedPassword)
 			if err != nil {
 				pgConn.conn.Close()
@@ -481,6 +556,21 @@ func hexMD5(s string) string {
 	hash := md5.New()
 	io.WriteString(hash, s)
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// hexHmacSM3 computes the HMAC-SM3 of the message using the key and returns it as a hex string.
+func hexHmacSM3(message string, key string) string {
+	mac := hmac.New(sm3.New, stringToBytes(key))
+	mac.Write(stringToBytes(message))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// stringToBytes converts a string to a byte slice without allocating a new slice.
+func stringToBytes(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 func (pgConn *PgConn) signalMessage() chan struct{} {

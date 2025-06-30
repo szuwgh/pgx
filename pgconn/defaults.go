@@ -18,7 +18,7 @@ func defaultSettings() map[string]string {
 	// Default to the OS user name. Purposely ignoring err getting user name from
 	// OS. The client application will simply have to specify the user in that
 	// case (which they typically will be doing anyway).
-	user, err := user.Current()
+	user, err := user.Current()   
 	if err == nil {
 		settings["user"] = user.Username
 		settings["passfile"] = filepath.Join(user.HomeDir, ".pgpass")
