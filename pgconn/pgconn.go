@@ -351,8 +351,6 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 	}
 	pgConn.config.SslTLCP = true
 	if pgConn.config.SslTLCP {
-		fmt.Println("use ssltclp")
-
 		pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
 		if err != nil {
 			return nil, newPerDialConnectError("dial error", err)
@@ -382,7 +380,6 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
 		pgConn.conn = tlcpConn
 
 	} else {
-		fmt.Println("connectConfig.network, connectConfig.address", connectConfig.network, connectConfig.address)
 		pgConn.conn, err = config.DialFunc(ctx, connectConfig.network, connectConfig.address)
 		if err != nil {
 			return nil, newPerDialConnectError("dial error", err)

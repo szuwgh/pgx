@@ -283,8 +283,6 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		settings = mergeSettings(defaultSettings, envSettings, serviceSettings, connStringSettings)
 	}
 
-	fmt.Println("settings:", settings)
-
 	config := &Config{
 		createdByParseConfig: true,
 		Database:             settings["database"],
@@ -383,7 +381,6 @@ func ParseConfigWithOptions(connString string, options ParseConfigOptions) (*Con
 		var tlcpConfigs []*tlcp.Config
 
 		if config.SslTLCP {
-			fmt.Println("config.SslTLCP is set, using TLCP protocol")
 			// If SslTLCP is set, we use the TLCP protocol.
 			if network, _ := NetworkAddress(host, port); network == "unix" {
 				tlcpConfigs = append(tlcpConfigs, nil)
