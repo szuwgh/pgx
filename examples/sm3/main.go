@@ -11,9 +11,8 @@ import (
 func main() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://unvdb:unvdb@192.168.4.134:5678/?sslmode=disable"
+		dbURL = "postgres://unvdb:unvdb@192.168.4.134:5678"
 	}
-
 	pool, err := pgxpool.New(context.Background(), dbURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to create connection pool: %v\n", err)
@@ -27,6 +26,5 @@ func main() {
 		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
 		os.Exit(1)
 	}
-
 	fmt.Println(greeting) // 输出: Hello, pool!
 }
